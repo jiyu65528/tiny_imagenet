@@ -1,0 +1,201 @@
+diff --git a/imagenet/main.py b/imagenet/main.py
+index e828ea0..005ac74 100644
+--- a/imagenet/main.py
++++ b/imagenet/main.py
+@@ -20,6 +20,7 @@ import torchvision.models as models
+ import torchvision.transforms as transforms
+ from torch.optim.lr_scheduler import StepLR
+ from torch.utils.data import Subset
++from torch.utils.tensorboard import SummaryWriter
+ 
+ model_names = sorted(name for name in models.__dict__
+     if name.islower() and not name.startswith("__")
+@@ -222,11 +223,19 @@ def main_worker(gpu, ngpus_per_node, args):
+             print("=> no checkpoint found at '{}'".format(args.resume))
+ 
+ 
++    writer_trainloss = SummaryWriter('runs/tinyimagenet_train_loss')
++    writer_valloss = SummaryWriter('runs/tinyimagenet_val_loss')
++    writer_acc1_train = SummaryWriter('runs/tinyimagenet_train_acc1')
++    writer_acc5_train = SummaryWriter('runs/tinyimagenet_train_acc5')
++    writer_acc1_val = SummaryWriter('runs/tinyimagenet_val_acc1')
++    writer_acc5_val = SummaryWriter('runs/tinyimagenet_val_acc5')
++
++    
+     # Data loading code
+     if args.dummy:
+         print("=> Dummy data is used!")
+-        train_dataset = datasets.FakeData(1281167, (3, 224, 224), 1000, transforms.ToTensor())
+-        val_dataset = datasets.FakeData(50000, (3, 224, 224), 1000, transforms.ToTensor())
++        train_dataset = datasets.FakeData(1281167, (3, 64, 64), 200, transforms.ToTensor())
++        val_dataset = datasets.FakeData(50000, (3, 64, 64), 200, transforms.ToTensor())
+     else:
+         traindir = os.path.join(args.data, 'train')
+         valdir = os.path.join(args.data, 'val')
+@@ -236,8 +245,6 @@ def main_worker(gpu, ngpus_per_node, args):
+         train_dataset = datasets.ImageFolder(
+             traindir,
+             transforms.Compose([
+-                transforms.RandomResizedCrop(224),
+-                transforms.RandomHorizontalFlip(),
+                 transforms.ToTensor(),
+                 normalize,
+             ]))
+@@ -245,8 +252,6 @@ def main_worker(gpu, ngpus_per_node, args):
+         val_dataset = datasets.ImageFolder(
+             valdir,
+             transforms.Compose([
+-                transforms.Resize(256),
+-                transforms.CenterCrop(224),
+                 transforms.ToTensor(),
+                 normalize,
+             ]))
+@@ -261,13 +266,13 @@ def main_worker(gpu, ngpus_per_node, args):
+     train_loader = torch.utils.data.DataLoader(
+         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+-
++    
+     val_loader = torch.utils.data.DataLoader(
+         val_dataset, batch_size=args.batch_size, shuffle=False,
+         num_workers=args.workers, pin_memory=True, sampler=val_sampler)
+ 
+     if args.evaluate:
+-        validate(val_loader, model, criterion, args)
++        validate(val_loader, model, criterion, 0, args, writer_valloss,writer_acc1_val,writer_acc5_val,len(train_loader))
+         return
+ 
+     for epoch in range(args.start_epoch, args.epochs):
+@@ -275,10 +280,10 @@ def main_worker(gpu, ngpus_per_node, args):
+             train_sampler.set_epoch(epoch)
+ 
+         # train for one epoch
+-        train(train_loader, model, criterion, optimizer, epoch, device, args)
++        train(train_loader, model, criterion, optimizer, epoch, device, args, writer_trainloss,writer_acc1_train,writer_acc5_train)
+ 
+         # evaluate on validation set
+-        acc1 = validate(val_loader, model, criterion, args)
++        acc1 = validate(val_loader, model, criterion, epoch, args, writer_valloss,writer_acc1_val,writer_acc5_val,len(train_loader))
+         
+         scheduler.step()
+         
+@@ -298,7 +303,8 @@ def main_worker(gpu, ngpus_per_node, args):
+             }, is_best)
+ 
+ 
+-def train(train_loader, model, criterion, optimizer, epoch, device, args):
++
++def train(train_loader, model, criterion, optimizer, epoch, device, args, writer_trainloss,writer_acc1_train,writer_acc5_train):
+     batch_time = AverageMeter('Time', ':6.3f')
+     data_time = AverageMeter('Data', ':6.3f')
+     losses = AverageMeter('Loss', ':.4e')
+@@ -308,7 +314,8 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
+         len(train_loader),
+         [batch_time, data_time, losses, top1, top5],
+         prefix="Epoch: [{}]".format(epoch))
+-
++    running_loss = 0.0
++    
+     # switch to train mode
+     model.train()
+ 
+@@ -340,15 +347,25 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
+         batch_time.update(time.time() - end)
+         end = time.time()
+ 
++        running_loss += loss.item()
+         if i % args.print_freq == 0:
+             progress.display(i + 1)
+-
+-
+-def validate(val_loader, model, criterion, args):
++            writer_trainloss.add_scalar('loss',
++                            running_loss / args.print_freq,
++                            epoch * len(train_loader) + i)
++            
++            writer_acc1_train.add_scalar('acc',
++                            acc1,epoch * len(train_loader) + i)
++                    
++            writer_acc5_train.add_scalar('acc',
++                            acc5,epoch * len(train_loader) + i)
++            running_loss = 0.0
++def validate(val_loader, model, criterion, epoch, args, writer_valloss,writer_acc1_val,writer_acc5_val,l):
+ 
+     def run_validate(loader, base_progress=0):
+         with torch.no_grad():
+             end = time.time()
++            running_loss = 0.0
+             for i, (images, target) in enumerate(loader):
+                 i = base_progress + i
+                 if args.gpu is not None and torch.cuda.is_available():
+@@ -359,6 +376,7 @@ def validate(val_loader, model, criterion, args):
+                 if torch.cuda.is_available():
+                     target = target.cuda(args.gpu, non_blocking=True)
+ 
++                
+                 # compute output
+                 output = model(images)
+                 loss = criterion(output, target)
+@@ -373,8 +391,18 @@ def validate(val_loader, model, criterion, args):
+                 batch_time.update(time.time() - end)
+                 end = time.time()
+ 
++                running_loss += loss.item()
+                 if i % args.print_freq == 0:
+                     progress.display(i + 1)
++                    writer_valloss.add_scalar('loss',
++                            running_loss / args.print_freq,
++                            epoch * l + i * l / len(val_loader))
++                    writer_acc1_val.add_scalar('acc',
++                                acc1,epoch * l + i * l / len(val_loader))
++                    
++                    writer_acc5_val.add_scalar('acc',
++                                acc5,epoch * l + i * l / len(val_loader))
++                    running_loss = 0.0
+ 
+     batch_time = AverageMeter('Time', ':6.3f', Summary.NONE)
+     losses = AverageMeter('Loss', ':.4e', Summary.NONE)
+diff --git a/imagenet/valdateset.py b/imagenet/valdateset.py
+new file mode 100644
+index 0000000..4657025
+--- /dev/null
++++ b/imagenet/valdateset.py
+@@ -0,0 +1,38 @@
++import os
++import shutil
++ 
++ 
++def main():
++    path = r"D:\mygit\examples\imagenet\tiny-imagenet-200\val\images"
++    newPath = r"D:\mygit\examples\imagenet\tiny-imagenet-200\val\%s"
++    f1 = open(r'D:\mygit\examples\imagenet\tiny-imagenet-200\val\val_annotations.txt','r')
++    rec={}
++    for (root, dirs, files) in os.walk(path):
++        for filename in files:
++            a=f1.readline().split()
++            if rec.setdefault(a[1])==None:
++                rec[a[1]]=0
++            else:
++                rec[a[1]]=rec[a[1]]+1
++            
++            singleFile = os.path.join(root, filename)
++            newFileDirs = newPath % (a[1]);
++            if not os.path.exists(newFileDirs):
++                os.mkdir(newFileDirs)
++            p=newFileDirs+'\\image'
++            if not os.path.exists(p):
++                os.mkdir(p)
++            shutil.copy(singleFile, p + "\\" + a[1]+'_'+str(rec[a[1]])+'.JPEG')
++            f2=open('D:\\mygit\\examples\\imagenet\\tiny-imagenet-200\\val\\'+a[1]+'\\'+a[1]+'.txt','a+')
++            num=a[1]
++            a.pop(0)
++            name=[num,'_',str(rec[num]),'.Jpeg']
++            a[0]=''.join(name)
++            a.append('\n')
++            f2.write('\t'.join(a))
++            f2.close()
++    pass
++ 
++ 
++if __name__ == '__main__':
++    main()
